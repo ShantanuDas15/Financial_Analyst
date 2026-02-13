@@ -6,6 +6,7 @@ import os
 from contextlib import contextmanager
 from fpdf import FPDF
 from datetime import datetime
+import base64
 
 # --- 0. SILENCE MANAGER ---
 @contextmanager
@@ -19,21 +20,20 @@ def suppress_output():
             sys.stdout = old_stdout
 
 
-def generate_pdf_report(results: list[dict], filename: str | None = None) -> str:
-    """Create a PDF report with summary table and per-ticker DCF insights.
-    Returns the path to the saved PDF file.
-    """
-    os.makedirs("reports", exist_ok=True)
-    if filename is None:
-        filename = f"reports/scan_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.pdf"
+def generate_pdf_report(results: list[dict], filename: str | None = None, return_bytes: bool = False):
+    """Create a PDF report. Either save to `filename` and return path, or return bytes when `return_bytes=True`.
 
+    - If `return_bytes` is True, the PDF bytes are returned (useful for in-memory download/base64).
+    - If `return_bytes` is False, the file is saved under `reports/` and the path is returned.
+    """
+    # build PDF
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(True, margin=12)
     pdf.add_page()
 
     # Title
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 8, "Wall Street Publisher — Scan Report", ln=True, align="C")
+    pdf.cell(0, 8, "Wall Street Publisher - Scan Report", ln=True, align="C")
     pdf.ln(4)
     pdf.set_font("Helvetica", "", 10)
     pdf.cell(0, 6, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%SZ')} (UTC)", ln=True)
@@ -61,9 +61,8 @@ def generate_pdf_report(results: list[dict], filename: str | None = None) -> str
     # Per-ticker detailed insights
     for r in results:
         pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 7, f"{r['Ticker']} — Detailed DCF & Assumptions", ln=True)
+        pdf.cell(0, 7, f"{r['Ticker']} - Detailed DCF & Assumptions", ln=True)
         pdf.set_font("Helvetica", "", 10)
-        # Assumptions
         assumptions = (
             f"Growth rate start: {r.get('growth_rate', 0):.0%} | "
             f"Decay rate: {r.get('decay_rate', 0):.0%} | "
@@ -73,7 +72,6 @@ def generate_pdf_report(results: list[dict], filename: str | None = None) -> str
         pdf.multi_cell(0, 5, assumptions)
         pdf.ln(2)
 
-        # Small projection table (Year / FCF)
         pdf.set_font("Helvetica", "B", 10)
         pdf.cell(30, 6, "Year", border=1, align="C")
         pdf.cell(50, 6, "Projected FCF", border=1, align="C")
@@ -90,14 +88,23 @@ def generate_pdf_report(results: list[dict], filename: str | None = None) -> str
             pdf.cell(50, 6, f"${pv:,.2f}", border=1, align="R")
             pdf.ln()
 
-        # Terminal value & headline numbers
         pdf.ln(2)
         pdf.cell(0, 5, f"Terminal value (post-year-5): ${r.get('term_val',0):,.2f}")
         pdf.ln(4)
         pdf.cell(0, 5, f"PV of projections: ${r.get('pv_fcf',0):,.2f} | PV of terminal: ${r.get('pv_term',0):,.2f}")
         pdf.ln(6)
 
-    # Save file
+    if return_bytes:
+        # Return PDF bytes. fpdf.output(dest='S') may return str or bytearray depending on version.
+        pdf_s = pdf.output(dest='S')
+        if isinstance(pdf_s, (bytes, bytearray)):
+            return bytes(pdf_s)
+        return str(pdf_s).encode('latin-1')
+
+    # Save file path
+    os.makedirs("reports", exist_ok=True)
+    if filename is None:
+        filename = f"reports/scan_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.pdf"
     pdf.output(filename)
     return filename
 
@@ -112,17 +119,10 @@ def publisher_persona() -> str:
     2. Output the raw Markdown table in the chat so I can see it immediately.
     """
 
-# --- 2. THE "BOSS" TOOL (Cloud Version) ---
-@mcp.tool()
-async def scan_and_publish(tickers: list[str]) -> str: # Changed: added async
-    """
-    Scans stocks, calculates DCF value, ranks them, returns markdown and saves a PDF with detailed insights.
-    Args:
-        tickers: List of symbols ['AAPL', 'NVDA']
-    """
-    results: list[dict] = []
-    print(f"Scanning: {tickers}...")
 
+# Helper: core scan logic extracted so both tools can reuse it
+def _scan_tickers(tickers: list[str]) -> list[dict]:
+    results: list[dict] = []
     for ticker in tickers:
         try:
             with suppress_output():
@@ -184,8 +184,20 @@ async def scan_and_publish(tickers: list[str]) -> str: # Changed: added async
         except Exception:
             continue
 
-    # Sort results
     results.sort(key=lambda x: x['Upside'], reverse=True)
+    return results
+
+
+# --- 2. THE "BOSS" TOOL (Cloud Version) ---
+@mcp.tool()
+async def scan_and_publish(tickers: list[str]) -> str: # Changed: added async
+    """
+    Scans stocks, calculates DCF value, ranks them, returns markdown and saves a PDF with detailed insights.
+    Args:
+        tickers: List of symbols ['AAPL', 'NVDA']
+    """
+    print(f"Scanning: {tickers}...")
+    results = _scan_tickers(tickers)
 
     # --- GENERATE MARKDOWN FOR CHAT (quick view) ---
     report = f"✅ **CLOUD SCAN COMPLETE**\n\n"
@@ -199,7 +211,7 @@ async def scan_and_publish(tickers: list[str]) -> str: # Changed: added async
     report += "\n---\n\n"
     report += "### Detailed insights\n\n"
     for r in results:
-        report += f"**{r['Ticker']}** — Current: ${r['Price']:.2f} | Fair value: ${r['Fair Value']:.2f} | Upside: {r['Upside']:.1f}%\n\n"
+        report += f"**{r['Ticker']}** - Current: ${r['Price']:.2f} | Fair value: ${r['Fair Value']:.2f} | Upside: {r['Upside']:.1f}%\n\n"
         report += "**Assumptions:**\n"
         report += f"- Start growth: {r['growth_rate']:.0%}, decay per year: {r['decay_rate']:.0%}\n"
         report += f"- Discount rate: {r['discount_rate']:.0%}, terminal multiple: {r['terminal_mult']}\n\n"
@@ -215,6 +227,31 @@ async def scan_and_publish(tickers: list[str]) -> str: # Changed: added async
     report += f"\nPDF report saved: `{pdf_path}`\n"
 
     return report
+
+
+# --- 3. DOWNLOADABLE-PDF TOOL (in-memory, base64) ---
+@mcp.tool()
+async def scan_and_publish_download(tickers: list[str]) -> str:
+    """Run the scan and return the PDF report as a base64 string (for direct download).
+
+    - Generates the PDF in-memory (works even on read-only file systems).
+    - Returns a markdown block containing filename + base64 payload.
+    """
+    results = _scan_tickers(tickers)
+    if not results:
+        return "No valid tickers processed - PDF not generated."
+
+    pdf_bytes = generate_pdf_report(results, return_bytes=True)
+    b64 = base64.b64encode(pdf_bytes).decode('ascii')
+    filename = f"scan_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.pdf"
+
+    md = (
+        f"✅ **CLOUD SCAN (download)**\n\n"
+        f"PDF filename: `{filename}`\n\n"
+        f"```base64\n{b64}\n```"
+    )
+    return md
+
 
 if __name__ == "__main__":
     # Changed: Explicitly run with Streamable HTTP transport on port 8000
