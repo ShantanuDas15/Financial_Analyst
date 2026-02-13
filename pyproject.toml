@@ -8,4 +8,5 @@ dependencies = [
     "fastmcp>=2.14.5",
     "yfinance",
     "pandas",
+    "fpdf2",
 ]

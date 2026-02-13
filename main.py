@@ -4,6 +4,8 @@ import pandas as pd
 import sys
 import os
 from contextlib import contextmanager
+from fpdf import FPDF
+from datetime import datetime
 
 # --- 0. SILENCE MANAGER ---
 @contextmanager
@@ -15,6 +17,90 @@ def suppress_output():
             yield
         finally:
             sys.stdout = old_stdout
+
+
+def generate_pdf_report(results: list[dict], filename: str | None = None) -> str:
+    """Create a PDF report with summary table and per-ticker DCF insights.
+    Returns the path to the saved PDF file.
+    """
+    os.makedirs("reports", exist_ok=True)
+    if filename is None:
+        filename = f"reports/scan_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.pdf"
+
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(True, margin=12)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 8, "Wall Street Publisher — Scan Report", ln=True, align="C")
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%SZ')} (UTC)", ln=True)
+    pdf.ln(4)
+
+    # Summary table header
+    pdf.set_font("Helvetica", "B", 11)
+    col_widths = [30, 34, 40, 30]
+    headers = ["Ticker", "Price", "Fair Value", "Upside %"]
+    for i, h in enumerate(headers):
+        pdf.cell(col_widths[i], 8, h, border=1, align="C")
+    pdf.ln()
+
+    # Summary table rows
+    pdf.set_font("Helvetica", "", 10)
+    for r in results:
+        pdf.cell(col_widths[0], 7, str(r.get("Ticker", "")), border=1)
+        pdf.cell(col_widths[1], 7, f"${r.get('Price',0):,.2f}", border=1, align="R")
+        pdf.cell(col_widths[2], 7, f"${r.get('Fair Value',0):,.2f}", border=1, align="R")
+        pdf.cell(col_widths[3], 7, f"{r.get('Upside',0):.1f}%", border=1, align="R")
+        pdf.ln()
+
+    pdf.ln(6)
+
+    # Per-ticker detailed insights
+    for r in results:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 7, f"{r['Ticker']} — Detailed DCF & Assumptions", ln=True)
+        pdf.set_font("Helvetica", "", 10)
+        # Assumptions
+        assumptions = (
+            f"Growth rate start: {r.get('growth_rate', 0):.0%} | "
+            f"Decay rate: {r.get('decay_rate', 0):.0%} | "
+            f"Discount rate: {r.get('discount_rate', 0):.0%} | "
+            f"Terminal multiple: {r.get('terminal_mult', 0)}"
+        )
+        pdf.multi_cell(0, 5, assumptions)
+        pdf.ln(2)
+
+        # Small projection table (Year / FCF)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(30, 6, "Year", border=1, align="C")
+        pdf.cell(50, 6, "Projected FCF", border=1, align="C")
+        pdf.cell(50, 6, "Discounted PV", border=1, align="C")
+        pdf.ln()
+        pdf.set_font("Helvetica", "", 10)
+
+        future = r.get("future_fcf", [])
+        discount = r.get("discount_rate", 0.10)
+        for i, fcf in enumerate(future, start=1):
+            pv = fcf / ((1 + discount) ** i)
+            pdf.cell(30, 6, f"Yr {i}", border=1)
+            pdf.cell(50, 6, f"${fcf:,.2f}", border=1, align="R")
+            pdf.cell(50, 6, f"${pv:,.2f}", border=1, align="R")
+            pdf.ln()
+
+        # Terminal value & headline numbers
+        pdf.ln(2)
+        pdf.cell(0, 5, f"Terminal value (post-year-5): ${r.get('term_val',0):,.2f}")
+        pdf.ln(4)
+        pdf.cell(0, 5, f"PV of projections: ${r.get('pv_fcf',0):,.2f} | PV of terminal: ${r.get('pv_term',0):,.2f}")
+        pdf.ln(6)
+
+    # Save file
+    pdf.output(filename)
+    return filename
+
 
 mcp = FastMCP("Wall Street Publisher")
 
@@ -30,76 +116,104 @@ def publisher_persona() -> str:
 @mcp.tool()
 async def scan_and_publish(tickers: list[str]) -> str: # Changed: added async
     """
-    Scans stocks, calculates DCF value, and ranks them.
+    Scans stocks, calculates DCF value, ranks them, returns markdown and saves a PDF with detailed insights.
     Args:
         tickers: List of symbols ['AAPL', 'NVDA']
     """
-    results = []
-    print(f"Scanning: {tickers}...") 
-    
+    results: list[dict] = []
+    print(f"Scanning: {tickers}...")
+
     for ticker in tickers:
         try:
-            # yfinance is synchronous, but we run it inside the async tool.
-            # in a heavy production app, you might offload this to a thread,
-            # but for the Inspector, this works fine.
             with suppress_output():
                 stock = yf.Ticker(ticker)
                 info = stock.info
-                
+
             fcf = info.get('freeCashflow')
             if not fcf:
                 ocf = info.get('operatingCashflow', 0)
                 capex = abs(info.get('capitalExpenditures', 0))
                 fcf = ocf - capex
-            
-            if not fcf or fcf <= 0: continue
+
+            if not fcf or fcf <= 0:
+                continue
 
             shares = info.get('sharesOutstanding', 1)
             current_price = info.get('currentPrice', 0)
-            
+
             # Assumptions (Boss Level: 40% Growth for Tech)
-            growth_rate = 0.40 
+            growth_rate = 0.40
             decay_rate = 0.05
             discount_rate = 0.10
             terminal_mult = 25
-            
-            # DCF Math
+
+            # DCF Math (5-year projection)
             current_fcf = fcf
-            future_fcf = []
+            future_fcf: list[float] = []
             g = growth_rate
             for _ in range(5):
                 current_fcf = current_fcf * (1 + g)
                 future_fcf.append(current_fcf)
                 g = max(0.05, g - decay_rate)
-                
+
             term_val = future_fcf[-1] * terminal_mult
-            pv_fcf = sum([f / ((1 + discount_rate) ** (i+1)) for i, f in enumerate(future_fcf)])
+            pv_fcf = sum([f / ((1 + discount_rate) ** (i + 1)) for i, f in enumerate(future_fcf)])
             pv_term = term_val / ((1 + discount_rate) ** 5)
-            
+
             fair_value = (pv_fcf + pv_term) / shares
-            upside = ((fair_value - current_price) / current_price) * 100
-            
+            upside = ((fair_value - current_price) / current_price) * 100 if current_price else 0.0
+
             results.append({
                 'Ticker': ticker,
                 'Price': current_price,
                 'Fair Value': fair_value,
-                'Upside': upside
+                'Upside': upside,
+                # detailed fields for PDF / insights
+                'shares': shares,
+                'fcf': fcf,
+                'future_fcf': future_fcf,
+                'pv_fcf': pv_fcf,
+                'pv_term': pv_term,
+                'term_val': term_val,
+                'growth_rate': growth_rate,
+                'decay_rate': decay_rate,
+                'discount_rate': discount_rate,
+                'terminal_mult': terminal_mult,
             })
-            
+
         except Exception:
             continue
 
     # Sort results
     results.sort(key=lambda x: x['Upside'], reverse=True)
-    
-    # --- GENERATE MARKDOWN FOR CHAT ---
+
+    # --- GENERATE MARKDOWN FOR CHAT (quick view) ---
     report = f"✅ **CLOUD SCAN COMPLETE**\n\n"
     report += f"| {'Ticker':<6} | {'Price':<8} | {'Fair Value':<10} | {'Upside %':<8} |\n"
     report += f"|{'-'*8}|{'-'*10}|{'-'*12}|{'-'*10}|\n"
-    
+
     for r in results:
         report += f"| {r['Ticker']:<6} | ${r['Price']:<7.2f} | ${r['Fair Value']:<9.2f} | {r['Upside']:>7.1f}% |\n"
-        
+
+    # --- DETAILED INSIGHTS (markdown) ---
+    report += "\n---\n\n"
+    report += "### Detailed insights\n\n"
+    for r in results:
+        report += f"**{r['Ticker']}** — Current: ${r['Price']:.2f} | Fair value: ${r['Fair Value']:.2f} | Upside: {r['Upside']:.1f}%\n\n"
+        report += "**Assumptions:**\n"
+        report += f"- Start growth: {r['growth_rate']:.0%}, decay per year: {r['decay_rate']:.0%}\n"
+        report += f"- Discount rate: {r['discount_rate']:.0%}, terminal multiple: {r['terminal_mult']}\n\n"
+        report += "**5‑year projection (FCF)**:\n"
+        report += "| Year | Projected FCF |\n"
+        report += "|---:|---:|\n"
+        for i, fcf in enumerate(r['future_fcf'], start=1):
+            report += f"| {i} | ${fcf:,.2f} |\n"
+        report += "\n"
+
+    # --- SAVE PDF REPORT ---
+    pdf_path = generate_pdf_report(results)
+    report += f"\nPDF report saved: `{pdf_path}`\n"
+
     return report
 
 if __name__ == "__main__":
